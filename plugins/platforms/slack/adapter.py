@@ -1563,6 +1563,38 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception:  # pragma: no cover - diagnostics must never break connect
             pass
 
+    def _warn_if_missing_core_scopes(self, auth_response, team_name: str) -> None:
+        """Warn once per workspace when core interaction scopes are absent: without them the bot
+        connects and reads but cannot reply, react, or resolve names — every failure then happens
+        downstream as a silent debug log. ``auth.test``'s ``x-oauth-scopes`` header at connect time
+        is the only detection point (same shape as the group-DM nudge)."""
+        try:
+            warned = self._lazy_attr("_core_scope_warned", set)
+            headers = getattr(auth_response, "headers", None) or {}
+            raw = headers.get("x-oauth-scopes") or headers.get("X-OAuth-Scopes") or ""
+            if not raw:
+                return  # Header absent (e.g. some proxies) — don't guess.
+            granted = {s.strip() for s in raw.split(",") if s.strip()}
+            team_key = team_name or ""
+            if team_key in warned:
+                return
+            consequences: dict[str, str] = {
+                "chat:write": "the bot cannot SEND any reply",
+                "reactions:write": "emoji interaction (processing acks) is impossible",
+                "app_mentions:read": "mention events are not delivered by the Events API",
+                "users:read": "user names cannot be resolved (raw IDs only)",
+            }
+            missing = [f"'{scope}' ({what})" for scope, what in consequences.items() if scope not in granted]
+            if missing:
+                warned.add(team_key)
+                logger.warning(
+                    "[Slack] Limited bot scopes in workspace %s — missing %s. Add the listed bot "
+                    "scopes in the Slack app config and REINSTALL the app to the workspace, then "
+                    "update the token. Reads may work, but interaction will fail silently until "
+                    "then.", team_key or "this workspace", ", ".join(missing))
+        except Exception:  # pragma: no cover - diagnostics must never break connect
+            pass
+
     def _warn_if_not_bot_token(self, auth_response, team_name: str) -> None:
         """Warn once per workspace when the token authenticates as a human: ``auth.test`` on an
         ``xoxp-`` token returns the installer's ``user_id`` and no ``bot_id``, so mentions OF THAT
@@ -1762,6 +1794,7 @@ class SlackAdapter(BasePlatformAdapter):
         self._warn_if_missing_group_dm_scopes(auth_response, team_name)
         self._warn_if_not_bot_token(auth_response, team_name)
         self._warn_if_inchannel_without_flat_reply(team_name)
+        self._warn_if_missing_core_scopes(auth_response, team_name)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Slack via Socket Mode."""
@@ -3229,7 +3262,9 @@ class SlackAdapter(BasePlatformAdapter):
             await method(channel=channel, timestamp=timestamp, name=emoji)
             return True
         except Exception as e:
-            logger.debug(
+            # WARNING (not debug): a reaction failure is usually a missing 'reactions:write'
+            # scope — invisible to the user as "the bot never reacted" unless it is surfaced.
+            logger.warning(
                 "[Slack] reactions.%s failed (%s): %s", "remove" if remove else "add", emoji, e)
             return False
 
