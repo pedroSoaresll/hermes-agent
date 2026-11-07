@@ -3,18 +3,23 @@
 Every terminal result dict the turn loop returns must carry ``failure_reason`` (a
 ``FailoverReason`` value or one of :data:`SITE_FAILURE_CODES`) and ``failure_retryable`` so
 ``agent/error_surface.py`` yields a specific descriptor instead of ``unknown``. The copy
-tables here say WHAT happened and WHAT TO DO in plain words; raw provider detail rides a
-trailing "Provider said:" / "Details:" line.
+tables here say WHAT happened and WHAT TO DO in plain words. Raw provider summaries are
+logged, never shown (BL-133): the provider-failure replies end with
+:func:`deferred_provider_notice` instead of a trailing ``Provider said:`` line; the capped
+``Details:`` lines on site-code copy stay.
 """
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, Dict, NamedTuple, Optional, Tuple
 
 from agent.error_classifier import FailoverReason
 from agent.stream_max_lifetime import StreamLifetimeExceeded
 from hermes_constants import display_hermes_home
+
+logger = logging.getLogger(__name__)
 
 # Failure codes minted by loop sites that are not provider verdicts (see module docstring).
 SITE_FAILURE_CODES = frozenset({
@@ -396,6 +401,27 @@ def site_copy(code: str, **fields: Any) -> str:
     return _SITE_COPY[code].format_map(_Defaults(fields))
 
 
+# BL-133: a raw provider summary (key_cmd output, retry counts, model-switch plumbing, OAuth
+# instructions) never reaches a user-visible failure reply — it surfaced verbatim in a
+# founder-facing thread on 2026-11-05. The full text is logged; the reply carries one plain
+# sentence: the AI model service can't take requests, and the work is deferred, not lost.
+_DEFERRED_WORK_NOTICE = (
+    "The work from this request is deferred, not lost — it will resume once the AI model "
+    "service can take requests again."
+)
+
+
+def deferred_provider_notice(summary: str) -> str:
+    """The user-visible replacement for a raw provider summary on a failed turn (BL-133).
+
+    Provider summaries carry operator mechanics — ``key_cmd`` output, retry counts,
+    model-switch plumbing, OAuth instructions — that must not reach a user's chat. The full
+    text is logged for debugging; the reply carries the plain deferral notice instead.
+    """
+    logger.warning("provider failure detail withheld from reply: %s", summary)
+    return _DEFERRED_WORK_NOTICE
+
+
 def exhausted_copy(reason: str, *, label: str, attempts: int, summary: str, reset_seconds: Optional[float] = None,
                    error: Any = None) -> str:
     """Chat copy once retries + fallback are exhausted (``max_retries_exhausted_result``). A rate
@@ -418,7 +444,7 @@ def exhausted_copy(reason: str, *, label: str, attempts: int, summary: str, rese
         situation = f"it looks temporarily unavailable. {_NEXT_STEPS_RETRY}"
     return (
         f"{lead} — {situation} To avoid this in future, "
-        f"add a backup provider with `hermes fallback add`.\n\nProvider said: {summary}"
+        f"add a backup provider with `hermes fallback add`.\n\n{deferred_provider_notice(summary)}"
     )
 
 
@@ -483,13 +509,13 @@ def nonretryable_copy(
     )
     body = template.format(label=label, model=model, home=display_hermes_home(), prefix_hint=prefix_hint,
                            relogin=oauth_relogin_command(provider))
-    return f"{body}\n\nProvider said: {summary}"
+    return f"{body}\n\n{deferred_provider_notice(summary)}"
 
 
 def content_policy_copy(*, label: str, summary: str) -> str:
     return (
         f"{label}'s safety filter refused this request, so the model didn't answer. "
-        f"{CONTENT_POLICY_NEXT_STEPS}\n\nProvider said: {summary}"
+        f"{CONTENT_POLICY_NEXT_STEPS}\n\n{deferred_provider_notice(summary)}"
     )
 
 

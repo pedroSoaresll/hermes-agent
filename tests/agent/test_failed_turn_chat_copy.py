@@ -94,7 +94,7 @@ def test_oauth_rejection_chat_text_names_the_provider_slug_and_the_failing_profi
     text = result["final_response"]
     assert "`hermes -p codex auth add openai-codex --type oauth`" in text
     assert "<provider>" not in text
-    assert "token_revoked" in text  # the raw error survives for the judge to quote
+    assert "token_revoked" not in text  # BL-133: raw provider detail is logged, never shown
     # The CLI 💡 hint names the same command; it no longer sends the user to a bare `hermes auth`.
     cli_hint = "\n".join(hints)
     assert "`hermes -p codex auth add openai-codex --type oauth`" in cli_hint, cli_hint

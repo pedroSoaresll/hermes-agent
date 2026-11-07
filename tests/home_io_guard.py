@@ -23,6 +23,28 @@ def _pm_generation_dirs(prefixes) -> set[Path]:
     return found
 
 
+def _worktree_git_dirs() -> set[Path]:
+    """The common git dir of every worktree this checkout participates in (``<main>/.git/
+    worktrees/<name>``), plus the checkout's own ``.git``. Repo plumbing, not Hermes state:
+    update-custody reads (<common-git-dir>/hermes-update-pull) from version_info paths, and a
+    worktree checked out inside the Hermes home trips the guard on its first run without this."""
+    found = set()
+    checkout = Path(__file__).resolve().parent.parent
+    dot_git = checkout / ".git"
+    if dot_git.is_file():
+        try:
+            text = dot_git.read_text(encoding="utf-8-sig").strip()
+            if text.startswith("gitdir:"):
+                common = Path(text[7:].strip())
+                if common.is_dir():
+                    found.add(common)
+        except OSError:
+            pass
+    else:
+        found.add(dot_git)
+    return found
+
+
 _INTERPRETER_PREFIXES = tuple({
     Path(p).resolve() for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
 } | {
@@ -42,6 +64,10 @@ _INTERPRETER_PREFIXES = tuple({
     # checkout's own .venv is not Hermes state; without this every run from a default install
     # trips on its first traceback.
     Path(__file__).resolve().parent.parent,
+    # A git worktree's .git is a FILE pointing into the main checkout's .git/worktrees/<name>;
+    # update-custody reads (<common-git-dir>/hermes-update-pull) are repo plumbing, not Hermes
+    # state. Without this every suite run from a worktree inside the home trips on version_info.
+    *_worktree_git_dirs(),
 })
 # The same prefixes as plain strings for the check() fast path. PurePath comparison folds case on
 # Windows; ``os.path.normcase`` (identity on POSIX) reproduces that for string compares. Prefixes
