@@ -463,6 +463,19 @@ def _slack_error_is(exc: BaseException, code: str) -> bool:
         return False
 
 
+def _slack_error_code(exc: BaseException) -> str:
+    """The structured Slack error code (``exc.response[\"error\"]``), or ``\"\"`` when absent.
+
+    The sibling of :func:`_slack_error_is` for logging: it reads the code, never the message text.
+    """
+    response = getattr(exc, "response", None)
+    try:
+        value = response.get("error") if response else ""
+    except Exception:
+        return ""
+    return value if isinstance(value, str) else ""
+
+
 def _slack_str_field(el: dict, name: str) -> str:
     """Read a string field of a Block Kit element; non-strings (text objects) would break ``str.join``."""
     value = el.get(name)
@@ -2760,20 +2773,29 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             # Evict oldest-thread-first (key[2] is the thread ts) so the newest survives.
             self._evict_oldest_by_ts(
                 self._active_status_threads, self._ACTIVE_STATUS_THREADS_MAX, lambda k: k[2])
-        # May lack assistant:write scope or assistant context; reactions still work.
-        _status = getattr(self, "_status_text", {}).get(str(chat_id)) or getattr(
-            self.config, "typing_status_text", None)
-        _status = _status or self._default_status_text(_status_started)
-        await self._set_thread_status(chat_id, team_id, thread_ts, _status, "failed")
+        # Slack's agent-session API accepts only processing / active / suspended / closed
+        # (live probe 2026-11-26: free text is rejected with invalid_arguments). The working
+        # phrase cannot reach the status line on this path, so the elapsed-time text is logged
+        # at DEBUG for operators instead.
+        logger.debug("[Slack] turn started in %s thread %s: %s", chat_id, thread_ts,
+                     self._default_status_text(_status_started))
+        _start = "processing" if _sdk_supports_agent_sessions() else (
+            getattr(self, "_status_text", {}).get(str(chat_id)) or getattr(
+                self.config, "typing_status_text", None) or self._default_status_text(_status_started))
+        await self._set_thread_status(chat_id, team_id, thread_ts, _start, "failed")
 
     async def _set_thread_status(
         self, chat_id: str, team_id: str, thread_ts: str, status: str, fail_label: str) -> None:
-        """``assistant.threads.setStatus`` (empty ``status`` clears); failures are debug-logged."""
+        """Set the agent-session status to one of the documented values (processing, active,
+        suspended, closed). Slack rejects anything else; rejections are logged at WARNING so a
+        silent status failure is visible to operators."""
         try:
             _set_status = _session_status_method(self._get_client(chat_id, team_id=team_id))
             await _set_status(channel_id=chat_id, thread_ts=thread_ts, status=status)
         except Exception as e:
-            logger.debug("[Slack] assistant.threads.setStatus %s: %s", fail_label, e)
+            code = _slack_error_code(e)
+            logger.warning("[Slack] setStatus %r in %s thread %s failed (%s): %s",
+                           status, chat_id, thread_ts, fail_label, code or e)
 
     @staticmethod
     def _default_status_text(started: Optional[float]) -> str:
@@ -2823,7 +2845,8 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             thread_ts = requested_thread_ts
         if not thread_ts:
             return
-        await self._set_thread_status(chat_id, team_id, thread_ts, "", "clear failed")
+        _clear = "active" if _sdk_supports_agent_sessions() else ""
+        await self._set_thread_status(chat_id, team_id, thread_ts, _clear, "clear failed")
 
     def _dm_top_level_threads_as_sessions(self) -> bool:
         """Each top-level DM reply thread is its own session (default True; set
