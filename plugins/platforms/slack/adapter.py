@@ -1621,6 +1621,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             ("message", self._handle_slack_message), ("app_mention", self._handle_slack_message),
             ("app_home_opened", self._handle_app_home_opened),
             ("app_context_changed", self._handle_app_context_changed),
+            ("agent_session_stopped", self._handle_agent_session_stopped),
             ("file_shared", self._handle_slack_file_shared), ("file_created", _noop),
             ("file_change", _noop), ("reaction_added", _reaction(False)),
             ("reaction_removed", _reaction(True)),
@@ -3818,6 +3819,55 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         await self._set_assistant_suggested_prompts(
             metadata.get("channel_id", ""), team_id=metadata.get("team_id", ""),
             thread_ts=metadata.get("thread_ts", ""))
+
+    async def _handle_agent_session_stopped(self, event: dict, body: Optional[dict] = None) -> None:
+        """A user clicked the native stop button on an agent session (doc: agent_session_stopped).
+
+        Slack does not move the session out of ``processing`` by itself, so this handler must:
+        (1) stop the run for this channel and thread, (2) let the user see that work stopped, and
+        (3) set the session status away from processing. The click is authorized against the same
+        interactive gate the approval buttons use, so a non-admin stop changes nothing.
+        """
+        channel_id = str((event or {}).get("channel") or "")
+        thread_ts = str((event or {}).get("thread_ts") or "")
+        if not channel_id or not thread_ts:
+            logger.debug("[Slack] agent_session_stopped without channel/thread; ignored")
+            return
+        user_id = str((event or {}).get("user") or "")
+        team_id = str(((body or {}).get("team_id")) or (event or {}).get("team") or "")
+        if not self._is_interactive_user_authorized(user_id, channel_id=channel_id, team_id=team_id):
+            logger.warning("[Slack] stop from unauthorized user %s in %s thread %s refused",
+                           user_id, channel_id, thread_ts)
+            return
+        try:
+            await self._stop_thread_run(channel_id, thread_ts, team_id=team_id, user_id=user_id)
+        except Exception as e:  # the status must still leave processing
+            logger.warning("[Slack] stop for %s thread %s failed: %s", channel_id, thread_ts, e)
+        await self._set_thread_status(channel_id, team_id, thread_ts, "active", "stop clear failed")
+
+    async def _stop_thread_run(self, channel_id: str, thread_ts: str, *, team_id: str = "",
+                               user_id: str = "") -> bool:
+        """Interrupt the running turn for this thread through the runner, as ``/stop`` does.
+
+        The session key is built from the same source an inbound thread message uses
+        (``build_source``), so it matches the run's key. Returns True when a turn was interrupted.
+        """
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        if runner is None or not hasattr(runner, "_interrupt_and_clear_session"):
+            return False
+        source = self.build_source(
+            chat_id=channel_id, chat_type="dm" if channel_id.startswith("D") else "group",
+            user_id=user_id or None, thread_id=thread_ts, scope_id=team_id or None)
+        from gateway.session import build_session_key
+        from gateway.run import _INTERRUPT_REASON_STOP
+        session_key = build_session_key(source)
+        running = getattr(runner, "_running_agents", {}) or {}
+        if session_key not in running:
+            return False
+        await runner._interrupt_and_clear_session(
+            session_key, source, interrupt_reason=_INTERRUPT_REASON_STOP,
+            invalidation_reason="agent_session_stopped")
+        return True
 
     async def _handle_app_context_changed(self, event: dict, body: Optional[dict] = None) -> None:
         """Cache the current Agent-view context without entering the agent loop."""
