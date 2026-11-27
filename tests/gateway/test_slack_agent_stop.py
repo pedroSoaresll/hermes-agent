@@ -135,13 +135,14 @@ async def test_stop_uses_the_runner_key_not_a_bare_session_key():
 
 
 @pytest.mark.asyncio
-async def test_stop_falls_back_to_the_single_running_key_for_the_thread():
+async def test_stop_never_interrupts_a_different_users_run_in_the_same_thread():
+    """No loose channel/thread match: another user's key for this thread must not be stopped."""
     a = _adapter()
-    key = "agent:other:slack:group:T1:C123:1700000000.000100:U9"
-    runner = _Runner({key: object(), "agent:barx:slack:group:T1:C999:1.2": object()})
+    other = "agent:barx:slack:group:T1:C123:1700000000.000100:U_OTHER"
+    runner = _Runner({other: object()})
     a.gateway_runner = runner
-    assert await a._stop_thread_run("C123", "1700000000.000100", team_id="T1", user_id="U_FOUNDER")
-    assert runner.interrupted[0][0] == key
+    assert not await a._stop_thread_run("C123", "1700000000.000100", team_id="T1", user_id="U_FOUNDER")
+    assert runner.interrupted == []
 
 
 @pytest.mark.asyncio
