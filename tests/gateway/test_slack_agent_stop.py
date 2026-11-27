@@ -165,3 +165,30 @@ async def test_stop_confirms_to_the_user_only_when_a_run_was_stopped():
     b._stop_thread_run = AsyncMock(return_value=False)
     await b._handle_agent_session_stopped(_EVENT, body={"team_id": "T1"})
     b._app.client.chat_postMessage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stop_key_equals_the_inbound_event_key_for_dm_and_channel_threads():
+    """The stop path must derive the exact key an inbound message in the thread runs under."""
+    from gateway.platforms.base import MessageEvent
+    for channel, ctype in (("D0DM", "dm"), ("C123", "group")):
+        a = _adapter()
+        thread = "1700000000.000100"
+        source = a._thread_session_source(channel, thread, "U_FOUNDER", "T1", ctype)
+        inbound_key = a._event_session_key(MessageEvent(text="hi", source=source))
+        runner = _Runner({inbound_key: object()})
+        a.gateway_runner = runner
+        assert await a._stop_thread_run(channel, thread, team_id="T1", user_id="U_FOUNDER"), channel
+        assert runner.interrupted[0][0] == inbound_key
+
+
+@pytest.mark.asyncio
+async def test_processing_status_is_sent_once_per_turn_not_every_keep_typing_tick():
+    """_keep_typing fires every 2 s; the documented status must not be re-sent on each tick."""
+    a = _adapter()
+    for _ in range(5):
+        await a.send_typing("C123", metadata={"thread_id": "1700000000.000100"})
+    assert a._app.client.agents_sessions_setStatus.await_count == 1
+    a._PROCESSING_REFRESH_SECONDS = 0.0
+    await a.send_typing("C123", metadata={"thread_id": "1700000000.000100"})
+    assert a._app.client.agents_sessions_setStatus.await_count == 2
