@@ -463,6 +463,19 @@ def _slack_error_is(exc: BaseException, code: str) -> bool:
         return False
 
 
+def _slack_error_code(exc: BaseException) -> str:
+    """The structured Slack error code (``exc.response[\"error\"]``), or ``\"\"`` when absent.
+
+    The sibling of :func:`_slack_error_is` for logging: it reads the code, never the message text.
+    """
+    response = getattr(exc, "response", None)
+    try:
+        value = response.get("error") if response else ""
+    except Exception:
+        return ""
+    return value if isinstance(value, str) else ""
+
+
 def _slack_str_field(el: dict, name: str) -> str:
     """Read a string field of a Block Kit element; non-strings (text objects) would break ``str.join``."""
     value = el.get(name)
@@ -1013,6 +1026,9 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
     _ASSISTANT_THREADS_MAX = _AGENT_VIEW_CONTEXTS_MAX = _THREAD_REHYDRATION_CHECKED_MAX = 5000
     _REACTING_MESSAGE_IDS_MAX = _TITLED_ASSISTANT_THREADS_MAX = 5000
     _CHANNEL_TEAM_MAX = 10000
+    _PROCESSING_REFRESH_SECONDS = 3000.0  # re-send ``processing`` inside Slack's 1 h timeout
+    _STATUS_RETRY_SECONDS = 30.0  # retry a rejected status call no sooner than this
+    _STATUS_RETRY_MAX_SECONDS = 300.0  # ceiling for a server-supplied Retry-After
     _APPROVAL_RESOLVED_MAX = _CLARIFY_RESOLVED_MAX = _ACTIVE_STATUS_THREADS_MAX = 1000
     _CLARIFY_MESSAGE_MAX = 1000
     # Tighter cap than the approval/clarify dicts: each entry holds the
@@ -1640,6 +1656,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             ("message", self._handle_slack_message), ("app_mention", self._handle_slack_message),
             ("app_home_opened", self._handle_app_home_opened),
             ("app_context_changed", self._handle_app_context_changed),
+            ("agent_session_stopped", self._handle_agent_session_stopped),
             ("file_shared", self._handle_slack_file_shared), ("file_created", _noop),
             ("file_change", _noop), ("reaction_added", _reaction(False)),
             ("reaction_removed", _reaction(True)),
@@ -2647,6 +2664,18 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             logger.debug(
                 "[Slack] chat.stopStream failed for %s/%s: %s", chat_id, stream.get("ts"), e)
             return False
+        finally:
+            # Slack moves the session to ``active`` when a stream is stopped. A mid-turn seal
+            # (tool-call segment break) leaves the turn running, so the change-only status gate
+            # must send ``processing`` again on the next tick; the final seal is followed by
+            # stop_typing, which drops this entry anyway.
+            # The stream key's team comes from scope_id_for_chat and the status key's from
+            # _channel_team, which can differ (one is empty before the first inbound event), so
+            # match on channel and thread.
+            for _k, _entry in list(self._active_status_threads.items()):
+                if _k[1:] == key[1:] and isinstance(_entry, dict):
+                    _entry["next_due"] = None
+                    _entry["gen"] = _entry.get("gen", 0) + 1
 
     async def _try_finalize_stream(
         self, chat_id: str, content: str, metadata: Optional[dict[str, Any]] = None
@@ -2754,26 +2783,93 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
                 _status_started = _prev_entry.get("started")
             if not isinstance(_status_started, (int, float)):
                 _status_started = time.monotonic()
-            self._active_status_threads[status_key] = {
-                "thread_ts": str(thread_ts), "team_id": str(team_id) if team_id else "",
-                "started": _status_started}
+            if isinstance(_prev_entry, dict):
+                # Update in place: an in-flight _send_processing holds this dict and records its
+                # result into it, even after the send_typing call that started it was cancelled.
+                _prev_entry.update(
+                    thread_ts=str(thread_ts), team_id=str(team_id) if team_id else "",
+                    started=_status_started)
+            else:
+                self._active_status_threads[status_key] = {
+                    "thread_ts": str(thread_ts), "team_id": str(team_id) if team_id else "",
+                    "started": _status_started, "next_due": None, "gen": 0}
             # Evict oldest-thread-first (key[2] is the thread ts) so the newest survives.
             self._evict_oldest_by_ts(
                 self._active_status_threads, self._ACTIVE_STATUS_THREADS_MAX, lambda k: k[2])
-        # May lack assistant:write scope or assistant context; reactions still work.
-        _status = getattr(self, "_status_text", {}).get(str(chat_id)) or getattr(
-            self.config, "typing_status_text", None)
-        _status = _status or self._default_status_text(_status_started)
-        await self._set_thread_status(chat_id, team_id, thread_ts, _status, "failed")
+        # Slack's agent-session API accepts only processing / active / suspended / closed
+        # (live probe 2026-11-26: free text is rejected with invalid_arguments). The working
+        # phrase cannot reach the status line on this path, so the elapsed-time text is logged
+        # at DEBUG for operators instead.
+        logger.debug("[Slack] turn started in %s thread %s: %s", chat_id, thread_ts,
+                     self._default_status_text(_status_started))
+        if _sdk_supports_agent_sessions() and status_key:
+            # _keep_typing calls this every 2 s under a 1.5 s per-call timeout. Send ``processing``
+            # when the status changes: at turn start, after a mid-turn stream seal (Slack sets
+            # ``active`` then), and again before Slack's 1-hour session timeout (doc 48 §1).
+            _entry = self._active_status_threads.get(status_key)
+            if isinstance(_entry, dict):
+                _now = self._status_clock()
+                _due = _entry.get("next_due")
+                if isinstance(_due, (int, float)) and _now < _due:
+                    return
+                # Claim the slot BEFORE awaiting, so a concurrent tick or a call cancelled by the
+                # 1.5 s timeout cannot send a second request. The shielded send records the real
+                # outcome even when this coroutine is cancelled.
+                _entry["next_due"] = _now + self._STATUS_RETRY_SECONDS
+                await asyncio.shield(self._send_processing(
+                    _entry, chat_id, team_id, thread_ts, _entry.get("gen", 0)))
+                return
+        _start = "processing" if _sdk_supports_agent_sessions() else (
+            getattr(self, "_status_text", {}).get(str(chat_id)) or getattr(
+                self.config, "typing_status_text", None) or self._default_status_text(_status_started))
+        await self._set_thread_status(chat_id, team_id, thread_ts, _start, "failed")
+
+    def _status_clock(self) -> float:
+        return time.monotonic()
+
+    async def _send_processing(
+        self, entry: dict[str, Any], chat_id: str, team_id: str, thread_ts: str, gen: int = 0
+    ) -> None:
+        """Send ``processing`` and record when the next send is due: after the 3000 s refresh on
+        success, after the retry delay (30 s, or Slack's Retry-After) on a rejection. A stream seal
+        that ran while the call was in flight bumped ``gen``: Slack set ``active`` after our
+        ``processing``, so the next tick must send again instead of waiting out the refresh."""
+        retry = await self._set_thread_status(chat_id, team_id, thread_ts, "processing", "failed")
+        if retry is None and entry.get("gen", 0) != gen:
+            entry["next_due"] = None
+            return
+        delay = self._PROCESSING_REFRESH_SECONDS if retry is None else retry
+        entry["next_due"] = self._status_clock() + delay
 
     async def _set_thread_status(
-        self, chat_id: str, team_id: str, thread_ts: str, status: str, fail_label: str) -> None:
-        """``assistant.threads.setStatus`` (empty ``status`` clears); failures are debug-logged."""
+        self, chat_id: str, team_id: str, thread_ts: str, status: str, fail_label: str
+    ) -> Optional[float]:
+        """Set the agent-session status to one of the documented values (processing, active,
+        suspended, closed). Slack rejects anything else; rejections are logged at WARNING so a
+        silent status failure is visible to operators.
+
+        Returns None on success, or the seconds to wait before retrying (Slack's Retry-After
+        when it sent one, else the default backoff)."""
         try:
             _set_status = _session_status_method(self._get_client(chat_id, team_id=team_id))
             await _set_status(channel_id=chat_id, thread_ts=thread_ts, status=status)
+            return None
         except Exception as e:
-            logger.debug("[Slack] assistant.threads.setStatus %s: %s", fail_label, e)
+            code = _slack_error_code(e)
+            logger.warning("[Slack] setStatus %r in %s thread %s failed (%s): %s",
+                           status, chat_id, thread_ts, fail_label, code or e)
+            return self._retry_delay_from(e)
+
+    def _retry_delay_from(self, exc: Exception) -> float:
+        """Seconds to wait after a rejected status call: Slack's Retry-After, bounded."""
+        try:
+            headers = getattr(getattr(exc, "response", None), "headers", None) or {}
+            raw = headers.get("Retry-After") or headers.get("retry-after")
+            if raw is not None:
+                return min(max(float(raw), self._STATUS_RETRY_SECONDS), self._STATUS_RETRY_MAX_SECONDS)
+        except (TypeError, ValueError, AttributeError):
+            pass
+        return self._STATUS_RETRY_SECONDS
 
     @staticmethod
     def _default_status_text(started: Optional[float]) -> str:
@@ -2803,6 +2899,12 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             active_key = self._workspace_thread_key(requested_team_id, chat_id, requested_thread_ts)
             if active_key:
                 active = self._active_status_threads.pop(active_key, None)
+            if active is None:
+                # send_typing may have tracked the thread with no team id (metadata without one);
+                # the exact team-less key then holds the entry and must not outlive the turn.
+                _teamless = self._workspace_thread_key("", chat_id, requested_thread_ts)
+                if _teamless:
+                    active = self._active_status_threads.pop(_teamless, None)
         else:
             # Slack Connect workspaces can share a channel ID, so a team-less clear
             # only pops a UNIQUE tracked match for this channel (+ thread when given).
@@ -2823,7 +2925,26 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             thread_ts = requested_thread_ts
         if not thread_ts:
             return
-        await self._set_thread_status(chat_id, team_id, thread_ts, "", "clear failed")
+        _clear = "active" if _sdk_supports_agent_sessions() else ""
+        _retry = await self._set_thread_status(chat_id, team_id, thread_ts, _clear, "clear failed")
+        if _retry is not None and _sdk_supports_agent_sessions():
+            self._schedule_clear_retry(chat_id, team_id, thread_ts, _retry)
+
+    def _schedule_clear_retry(
+        self, chat_id: str, team_id: str, thread_ts: str, delay: float) -> None:
+        """Retry a rejected ``active`` once after ``delay``: a failed clear would otherwise leave
+        the thread on ``processing`` until Slack's one-hour timeout."""
+        async def _retry() -> None:
+            await asyncio.sleep(delay)
+            if any(self._workspace_thread_key(t, chat_id, thread_ts) in self._active_status_threads
+                   for t in {team_id, ""}):
+                return  # a new turn started: it owns the status now
+            await self._set_thread_status(chat_id, team_id, thread_ts, "active", "clear retry failed")
+
+        task = asyncio.ensure_future(_retry())
+        tasks = self.__dict__.setdefault("_status_retry_tasks", set())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
     def _dm_top_level_threads_as_sessions(self) -> bool:
         """Each top-level DM reply thread is its own session (default True; set
@@ -3830,6 +3951,78 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         await self._set_assistant_suggested_prompts(
             metadata.get("channel_id", ""), team_id=metadata.get("team_id", ""),
             thread_ts=metadata.get("thread_ts", ""))
+
+    async def _handle_agent_session_stopped(self, event: dict, body: Optional[dict] = None) -> None:
+        """A user clicked the native stop button on an agent session (doc: agent_session_stopped).
+
+        Slack does not move the session out of ``processing`` by itself, so this handler must:
+        (1) stop the run for this channel and thread, (2) let the user see that work stopped, and
+        (3) set the session status away from processing. The click is authorized against the same
+        interactive gate the approval buttons use, so a non-admin stop changes nothing.
+        """
+        channel_id = str((event or {}).get("channel") or "")
+        thread_ts = str((event or {}).get("thread_ts") or "")
+        if not channel_id or not thread_ts:
+            logger.debug("[Slack] agent_session_stopped without channel/thread; ignored")
+            return
+        user_id = str((event or {}).get("user") or "")
+        team_id = str(((body or {}).get("team_id")) or (event or {}).get("team") or "")
+        if not self._is_interactive_user_authorized(user_id, channel_id=channel_id, team_id=team_id):
+            logger.warning("[Slack] stop from unauthorized user %s in %s thread %s refused",
+                           user_id, channel_id, thread_ts)
+            return
+        stopped = False
+        try:
+            stopped = await self._stop_thread_run(
+                channel_id, thread_ts, team_id=team_id, user_id=user_id)
+        except Exception as e:  # the status must still leave processing
+            logger.warning("[Slack] stop for %s thread %s failed: %s", channel_id, thread_ts, e)
+        if stopped:
+            # Doc contract step 2: the user must see that work stopped.
+            try:
+                await self._get_client(channel_id, team_id=team_id).chat_postMessage(
+                    channel=channel_id, thread_ts=thread_ts, text="Stopped.")
+            except Exception as e:
+                logger.warning("[Slack] stop confirmation in %s thread %s failed: %s",
+                               channel_id, thread_ts, _slack_error_code(e) or e)
+        else:
+            logger.warning("[Slack] stop click in %s thread %s found no running turn",
+                           channel_id, thread_ts)
+        await self._set_thread_status(channel_id, team_id, thread_ts, "active", "stop clear failed")
+
+    async def _stop_thread_run(self, channel_id: str, thread_ts: str, *, team_id: str = "",
+                               user_id: str = "") -> bool:
+        """Interrupt the running turn for this thread through the runner, as ``/stop`` does.
+
+        The key comes from the runner's own ``_session_key_for_source`` (profile namespace, DM
+        thread canonicalization), never a bare ``build_session_key``: under ``multiplex_profiles``
+        the two differ and a bare key would clear the indicator while the run keeps going. If the
+        exact key is not running, the single running key that names this channel and thread is
+        used. Returns True when a turn was interrupted.
+        """
+        runner = getattr(self, "gateway_runner", None) or getattr(
+            getattr(self, "_message_handler", None), "__self__", None)
+        if runner is None or not hasattr(runner, "_interrupt_and_clear_session"):
+            logger.warning("[Slack] stop: no gateway runner bound to the adapter")
+            return False
+        source = self._thread_session_source(
+            channel_id, thread_ts, user_id, team_id,
+            "dm" if channel_id.startswith("D") else "group")
+        from gateway.run import _INTERRUPT_REASON_STOP
+        running = getattr(runner, "_running_agents", {}) or {}
+        # Candidate keys, each exact: the adapter's inbound seam (the key the turn started under),
+        # then the runner's own derivation. No substring matching: it could stop another user's run.
+        candidates = [self._source_session_key(source)]
+        key_for = getattr(runner, "_session_key_for_source", None)
+        if callable(key_for):
+            candidates.append(key_for(source))
+        session_key = next((k for k in candidates if k and k in running), None)
+        if session_key is None:
+            return False
+        await runner._interrupt_and_clear_session(
+            session_key, source, interrupt_reason=_INTERRUPT_REASON_STOP,
+            invalidation_reason="agent_session_stopped")
+        return True
 
     async def _handle_app_context_changed(self, event: dict, body: Optional[dict] = None) -> None:
         """Cache the current Agent-view context without entering the agent loop."""
