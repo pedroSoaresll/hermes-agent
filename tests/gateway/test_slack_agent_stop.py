@@ -105,3 +105,62 @@ def test_listener_is_registered_for_agent_session_stopped():
     assert '"agent_session_stopped", self._handle_agent_session_stopped' in src
     assert src.index('"agent_session_stopped", self._handle_agent_session_stopped') < src.index(
         "Catch-all ack")
+
+
+class _Runner:
+    """A runner whose keys carry a profile namespace, as under ``multiplex_profiles``."""
+
+    def __init__(self, running):
+        self._running_agents = running
+        self.interrupted = []
+
+    def _session_key_for_source(self, source):
+        return f"agent:barx:slack:group:T1:{source.chat_id}:{source.thread_id}"
+
+    async def _interrupt_and_clear_session(self, key, source, **kw):
+        self.interrupted.append((key, kw))
+
+
+@pytest.mark.asyncio
+async def test_stop_uses_the_runner_key_not_a_bare_session_key():
+    """Under multiplex the run is stored under the runner's profile-namespaced key. A bare
+    build_session_key misses it, so the click would clear the indicator while the run keeps going."""
+    a = _adapter()
+    key = "agent:barx:slack:group:T1:C123:1700000000.000100"
+    runner = _Runner({key: object()})
+    a.gateway_runner = runner
+    assert await a._stop_thread_run("C123", "1700000000.000100", team_id="T1", user_id="U_FOUNDER")
+    assert runner.interrupted and runner.interrupted[0][0] == key
+    assert runner.interrupted[0][1]["invalidation_reason"] == "agent_session_stopped"
+
+
+@pytest.mark.asyncio
+async def test_stop_falls_back_to_the_single_running_key_for_the_thread():
+    a = _adapter()
+    key = "agent:other:slack:group:T1:C123:1700000000.000100:U9"
+    runner = _Runner({key: object(), "agent:barx:slack:group:T1:C999:1.2": object()})
+    a.gateway_runner = runner
+    assert await a._stop_thread_run("C123", "1700000000.000100", team_id="T1", user_id="U_FOUNDER")
+    assert runner.interrupted[0][0] == key
+
+
+@pytest.mark.asyncio
+async def test_stop_with_no_matching_run_interrupts_nothing():
+    a = _adapter()
+    runner = _Runner({"agent:barx:slack:group:T1:C999:1.2": object()})
+    a.gateway_runner = runner
+    assert not await a._stop_thread_run("C123", "1700000000.000100", team_id="T1", user_id="U_FOUNDER")
+    assert runner.interrupted == []
+
+
+@pytest.mark.asyncio
+async def test_stop_confirms_to_the_user_only_when_a_run_was_stopped():
+    a = _adapter()
+    a._stop_thread_run = AsyncMock(return_value=True)
+    await a._handle_agent_session_stopped(_EVENT, body={"team_id": "T1"})
+    a._app.client.chat_postMessage.assert_awaited_once()
+    assert a._app.client.chat_postMessage.await_args.kwargs["thread_ts"] == "1700000000.000100"
+    b = _adapter()
+    b._stop_thread_run = AsyncMock(return_value=False)
+    await b._handle_agent_session_stopped(_EVENT, body={"team_id": "T1"})
+    b._app.client.chat_postMessage.assert_not_awaited()

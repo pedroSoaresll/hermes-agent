@@ -3839,31 +3839,58 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             logger.warning("[Slack] stop from unauthorized user %s in %s thread %s refused",
                            user_id, channel_id, thread_ts)
             return
+        stopped = False
         try:
-            await self._stop_thread_run(channel_id, thread_ts, team_id=team_id, user_id=user_id)
+            stopped = await self._stop_thread_run(
+                channel_id, thread_ts, team_id=team_id, user_id=user_id)
         except Exception as e:  # the status must still leave processing
             logger.warning("[Slack] stop for %s thread %s failed: %s", channel_id, thread_ts, e)
+        if stopped:
+            # Doc contract step 2: the user must see that work stopped.
+            try:
+                await self._get_client(channel_id, team_id=team_id).chat_postMessage(
+                    channel=channel_id, thread_ts=thread_ts, text="Stopped.")
+            except Exception as e:
+                logger.warning("[Slack] stop confirmation in %s thread %s failed: %s",
+                               channel_id, thread_ts, _slack_error_code(e) or e)
+        else:
+            logger.warning("[Slack] stop click in %s thread %s found no running turn",
+                           channel_id, thread_ts)
         await self._set_thread_status(channel_id, team_id, thread_ts, "active", "stop clear failed")
 
     async def _stop_thread_run(self, channel_id: str, thread_ts: str, *, team_id: str = "",
                                user_id: str = "") -> bool:
         """Interrupt the running turn for this thread through the runner, as ``/stop`` does.
 
-        The session key is built from the same source an inbound thread message uses
-        (``build_source``), so it matches the run's key. Returns True when a turn was interrupted.
+        The key comes from the runner's own ``_session_key_for_source`` (profile namespace, DM
+        thread canonicalization), never a bare ``build_session_key``: under ``multiplex_profiles``
+        the two differ and a bare key would clear the indicator while the run keeps going. If the
+        exact key is not running, the single running key that names this channel and thread is
+        used. Returns True when a turn was interrupted.
         """
-        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        runner = getattr(self, "gateway_runner", None) or getattr(
+            getattr(self, "_message_handler", None), "__self__", None)
         if runner is None or not hasattr(runner, "_interrupt_and_clear_session"):
+            logger.warning("[Slack] stop: no gateway runner bound to the adapter")
             return False
-        source = self.build_source(
-            chat_id=channel_id, chat_type="dm" if channel_id.startswith("D") else "group",
-            user_id=user_id or None, thread_id=thread_ts, scope_id=team_id or None)
-        from gateway.session import build_session_key
+        source = self._thread_session_source(
+            channel_id, thread_ts, user_id, team_id,
+            "dm" if channel_id.startswith("D") else "group")
         from gateway.run import _INTERRUPT_REASON_STOP
-        session_key = build_session_key(source)
+        key_for = getattr(runner, "_session_key_for_source", None)
+        if callable(key_for):
+            session_key = key_for(source)
+        else:
+            from gateway.session import build_session_key
+            session_key = build_session_key(source)
         running = getattr(runner, "_running_agents", {}) or {}
         if session_key not in running:
-            return False
+            parts = [str(k) for k in running if isinstance(k, str)]
+            hits = [k for k in parts
+                    if channel_id in k.split(":") and thread_ts in k.split(":")]
+            if len(hits) != 1:
+                return False
+            session_key = hits[0]
         await runner._interrupt_and_clear_session(
             session_key, source, interrupt_reason=_INTERRUPT_REASON_STOP,
             invalidation_reason="agent_session_stopped")
