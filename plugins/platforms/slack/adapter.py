@@ -2754,6 +2754,8 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         team_id = self._metadata_team_id(metadata) or self._channel_team.get(chat_id, "")
         status_key = self._workspace_thread_key(team_id, chat_id, str(thread_ts))
         _status_started: Optional[float] = None
+        _next_due: Optional[float] = None
+        _entry: Optional[dict[str, Any]] = None
         if status_key:
             # Keep the first start time across _keep_typing refreshes so long turns show elapsed
             # time; stored in the status entry so it shares eviction/stop_typing cleanup.
@@ -2765,11 +2767,13 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             _prev_entry = self._active_status_threads.get(status_key)
             if isinstance(_prev_entry, dict):
                 _status_started = _prev_entry.get("started")
+                _next_due = _prev_entry.get("next_due")
             if not isinstance(_status_started, (int, float)):
                 _status_started = time.monotonic()
-            self._active_status_threads[status_key] = {
+            _entry = {
                 "thread_ts": str(thread_ts), "team_id": str(team_id) if team_id else "",
                 "started": _status_started}
+            self._active_status_threads[status_key] = _entry
             # Evict oldest-thread-first (key[2] is the thread ts) so the newest survives.
             self._evict_oldest_by_ts(
                 self._active_status_threads, self._ACTIVE_STATUS_THREADS_MAX, lambda k: k[2])
@@ -2777,25 +2781,47 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         # (live probe 2026-11-26: free text is rejected with invalid_arguments). The working
         # phrase cannot reach the status line on this path, so the elapsed-time text is logged
         # at DEBUG for operators instead.
+        _agent_sessions = _sdk_supports_agent_sessions()
+        if _agent_sessions and _entry is not None:
+            # Change-only: ``processing`` is sent when the turn starts and again before Slack's
+            # one-hour timeout, not on every _keep_typing tick (about 30 calls a minute per turn
+            # against a Tier 3 limit of 50+). A failed send retries on a short backoff.
+            _now = self._status_clock()
+            if isinstance(_next_due, (int, float)) and _now < _next_due:
+                _entry["next_due"] = _next_due
+                return
         logger.debug("[Slack] turn started in %s thread %s: %s", chat_id, thread_ts,
                      self._default_status_text(_status_started))
-        _start = "processing" if _sdk_supports_agent_sessions() else (
+        _start = "processing" if _agent_sessions else (
             getattr(self, "_status_text", {}).get(str(chat_id)) or getattr(
                 self.config, "typing_status_text", None) or self._default_status_text(_status_started))
-        await self._set_thread_status(chat_id, team_id, thread_ts, _start, "failed")
+        _ok = await self._set_thread_status(chat_id, team_id, thread_ts, _start, "failed")
+        if _agent_sessions and _entry is not None:
+            _entry["next_due"] = self._status_clock() + (
+                self._STATUS_RESEND_SECS if _ok else self._STATUS_RETRY_SECS)
+
+    # Slack drops an agent session's ``processing`` back to ``active`` after one hour; re-send
+    # inside that window while a turn is live. A rejected call retries after the short backoff.
+    _STATUS_RESEND_SECS = 3000.0
+    _STATUS_RETRY_SECS = 30.0
+
+    def _status_clock(self) -> float:
+        return time.monotonic()
 
     async def _set_thread_status(
-        self, chat_id: str, team_id: str, thread_ts: str, status: str, fail_label: str) -> None:
+        self, chat_id: str, team_id: str, thread_ts: str, status: str, fail_label: str) -> bool:
         """Set the agent-session status to one of the documented values (processing, active,
         suspended, closed). Slack rejects anything else; rejections are logged at WARNING so a
         silent status failure is visible to operators."""
         try:
             _set_status = _session_status_method(self._get_client(chat_id, team_id=team_id))
             await _set_status(channel_id=chat_id, thread_ts=thread_ts, status=status)
+            return True
         except Exception as e:
             code = _slack_error_code(e)
             logger.warning("[Slack] setStatus %r in %s thread %s failed (%s): %s",
                            status, chat_id, thread_ts, fail_label, code or e)
+            return False
 
     @staticmethod
     def _default_status_text(started: Optional[float]) -> str:
