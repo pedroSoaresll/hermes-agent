@@ -2835,7 +2835,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         that ran while the call was in flight bumped ``gen``: Slack set ``active`` after our
         ``processing``, so the next tick must send again instead of waiting out the refresh."""
         retry = await self._set_thread_status(chat_id, team_id, thread_ts, "processing", "failed")
-        if entry.get("gen", 0) != gen:
+        if retry is None and entry.get("gen", 0) != gen:
             entry["next_due"] = None
             return
         delay = self._PROCESSING_REFRESH_SECONDS if retry is None else retry

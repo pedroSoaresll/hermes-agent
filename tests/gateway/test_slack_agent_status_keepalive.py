@@ -347,3 +347,24 @@ async def test_seal_resets_a_status_entry_tracked_under_a_different_team_key():
     a._now[0] += 2.0
     await a.send_typing(CHAT, metadata=THREAD)
     assert _sent(a) == ["processing", "processing"]
+
+
+@pytest.mark.asyncio
+async def test_seal_during_a_rejected_call_keeps_the_retry_after():
+    """A rejection keeps its Retry-After even when a seal bumped the generation meanwhile."""
+    a = _adapter()
+    gate = asyncio.Event()
+
+    async def slow_rate_limited(**kwargs):
+        await gate.wait()
+        raise _err("ratelimited", {"Retry-After": "120"})
+
+    a._app.client.agents_sessions_setStatus = AsyncMock(side_effect=slow_rate_limited)
+    first = asyncio.ensure_future(a.send_typing(CHAT, metadata=THREAD))
+    await asyncio.sleep(0.02)
+    await a._seal_stream(next(iter(a._active_status_threads)), {"ts": "1700000001.000100"})
+    gate.set()
+    await first
+    a._now[0] += 2.0
+    await a.send_typing(CHAT, metadata=THREAD)
+    assert a._app.client.agents_sessions_setStatus.await_count == 1
