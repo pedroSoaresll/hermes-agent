@@ -1026,6 +1026,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
     _ASSISTANT_THREADS_MAX = _AGENT_VIEW_CONTEXTS_MAX = _THREAD_REHYDRATION_CHECKED_MAX = 5000
     _REACTING_MESSAGE_IDS_MAX = _TITLED_ASSISTANT_THREADS_MAX = 5000
     _CHANNEL_TEAM_MAX = 10000
+    _PROCESSING_REFRESH_SECONDS = 1800.0  # re-send ``processing`` well inside Slack's 1 h timeout
     _APPROVAL_RESOLVED_MAX = _CLARIFY_RESOLVED_MAX = _ACTIVE_STATUS_THREADS_MAX = 1000
     _CLARIFY_MESSAGE_MAX = 1000
     # Tighter cap than the approval/clarify dicts: each entry holds the
@@ -2735,9 +2736,10 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
                 _status_started = _prev_entry.get("started")
             if not isinstance(_status_started, (int, float)):
                 _status_started = time.monotonic()
+            _sent_at = _prev_entry.get("processing_sent_at") if isinstance(_prev_entry, dict) else None
             self._active_status_threads[status_key] = {
                 "thread_ts": str(thread_ts), "team_id": str(team_id) if team_id else "",
-                "started": _status_started}
+                "started": _status_started, "processing_sent_at": _sent_at}
             # Evict oldest-thread-first (key[2] is the thread ts) so the newest survives.
             self._evict_oldest_by_ts(
                 self._active_status_threads, self._ACTIVE_STATUS_THREADS_MAX, lambda k: k[2])
@@ -2747,6 +2749,16 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         # at DEBUG for operators instead.
         logger.debug("[Slack] turn started in %s thread %s: %s", chat_id, thread_ts,
                      self._default_status_text(_status_started))
+        if _sdk_supports_agent_sessions() and status_key:
+            # _keep_typing calls this every 2 s. The documented status is idempotent, so send it
+            # once per turn and again only before Slack's 1-hour session timeout (doc 48 §1).
+            _entry = self._active_status_threads.get(status_key)
+            _last = _entry.get("processing_sent_at") if isinstance(_entry, dict) else None
+            _now = time.monotonic()
+            if isinstance(_last, (int, float)) and _now - _last < self._PROCESSING_REFRESH_SECONDS:
+                return
+            if isinstance(_entry, dict):
+                _entry["processing_sent_at"] = _now
         _start = "processing" if _sdk_supports_agent_sessions() else (
             getattr(self, "_status_text", {}).get(str(chat_id)) or getattr(
                 self.config, "typing_status_text", None) or self._default_status_text(_status_started))
@@ -3877,14 +3889,15 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             channel_id, thread_ts, user_id, team_id,
             "dm" if channel_id.startswith("D") else "group")
         from gateway.run import _INTERRUPT_REASON_STOP
+        running = getattr(runner, "_running_agents", {}) or {}
+        # Candidate keys, each exact: the adapter's inbound seam (the key the turn started under),
+        # then the runner's own derivation. No substring matching: it could stop another user's run.
+        candidates = [self._source_session_key(source)]
         key_for = getattr(runner, "_session_key_for_source", None)
         if callable(key_for):
-            session_key = key_for(source)
-        else:
-            from gateway.session import build_session_key
-            session_key = build_session_key(source)
-        running = getattr(runner, "_running_agents", {}) or {}
-        if session_key not in running:
+            candidates.append(key_for(source))
+        session_key = next((k for k in candidates if k and k in running), None)
+        if session_key is None:
             return False
         await runner._interrupt_and_clear_session(
             session_key, source, interrupt_reason=_INTERRUPT_REASON_STOP,
