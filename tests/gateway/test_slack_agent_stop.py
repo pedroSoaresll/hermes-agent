@@ -186,9 +186,11 @@ async def test_stop_key_equals_the_inbound_event_key_for_dm_and_channel_threads(
 async def test_processing_status_is_sent_once_per_turn_not_every_keep_typing_tick():
     """_keep_typing fires every 2 s; the documented status must not be re-sent on each tick."""
     a = _adapter()
+    clock = [1000.0]
+    a._status_clock = lambda: clock[0]
     for _ in range(5):
         await a.send_typing("C123", metadata={"thread_id": "1700000000.000100"})
     assert a._app.client.agents_sessions_setStatus.await_count == 1
-    a._PROCESSING_REFRESH_SECONDS = 0.0
+    clock[0] += a._PROCESSING_REFRESH_SECONDS + 1
     await a.send_typing("C123", metadata={"thread_id": "1700000000.000100"})
     assert a._app.client.agents_sessions_setStatus.await_count == 2
