@@ -3920,12 +3920,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             session_key = build_session_key(source)
         running = getattr(runner, "_running_agents", {}) or {}
         if session_key not in running:
-            parts = [str(k) for k in running if isinstance(k, str)]
-            hits = [k for k in parts
-                    if channel_id in k.split(":") and thread_ts in k.split(":")]
-            if len(hits) != 1:
-                return False
-            session_key = hits[0]
+            return False
         await runner._interrupt_and_clear_session(
             session_key, source, interrupt_reason=_INTERRUPT_REASON_STOP,
             invalidation_reason="agent_session_stopped")
