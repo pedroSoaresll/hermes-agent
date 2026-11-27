@@ -263,3 +263,87 @@ async def test_legacy_assistant_threads_path_still_refreshes_every_tick():
         await a.send_typing(CHAT, metadata=THREAD)
         a._now[0] += 2.0
     assert a._app.client.assistant_threads_setStatus.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_cancelled_call_that_later_fails_still_honours_retry_after():
+    """The cancelled call's result lands in the live entry even though later ticks refreshed it
+    (reviewer probe P2): Retry-After 120 must hold, not the 30 s default."""
+    a = _adapter()
+    gate = asyncio.Event()
+
+    async def slow_then_rate_limited(**kwargs):
+        await gate.wait()
+        raise _err("ratelimited", {"Retry-After": "120"})
+
+    a._app.client.agents_sessions_setStatus = AsyncMock(side_effect=slow_then_rate_limited)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(a.send_typing(CHAT, metadata=THREAD), timeout=0.05)
+    a._now[0] += 2.0
+    await a.send_typing(CHAT, metadata=THREAD)  # tick while the call is still in flight
+    gate.set()
+    await asyncio.sleep(0.05)
+    a._now[0] += 60.0  # past the 30 s default, inside Retry-After
+    await a.send_typing(CHAT, metadata=THREAD)
+    assert a._app.client.agents_sessions_setStatus.await_count == 1
+    a._now[0] += 61.0
+    await a.send_typing(CHAT, metadata=THREAD)
+    assert a._app.client.agents_sessions_setStatus.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_call_that_later_succeeds_is_not_resent_after_the_retry_window():
+    """Reviewer probe P1: success of a cancelled call must be recorded in the live entry."""
+    a = _adapter()
+    gate = asyncio.Event()
+
+    async def slow(**kwargs):
+        await gate.wait()
+        return {"ok": True}
+
+    a._app.client.agents_sessions_setStatus = AsyncMock(side_effect=slow)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(a.send_typing(CHAT, metadata=THREAD), timeout=0.05)
+    a._now[0] += 2.0
+    await a.send_typing(CHAT, metadata=THREAD)
+    gate.set()
+    await asyncio.sleep(0.05)
+    a._now[0] += a._STATUS_RETRY_SECONDS + 1  # past the claim window
+    await a.send_typing(CHAT, metadata=THREAD)
+    assert a._app.client.agents_sessions_setStatus.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_seal_during_an_in_flight_processing_call_resends():
+    """A seal that runs while processing is in flight: Slack sets active after it, so the result
+    of the older call must not push the next send out to the refresh interval (probe P4)."""
+    a = _adapter()
+    gate = asyncio.Event()
+
+    async def slow(**kwargs):
+        await gate.wait()
+        return {"ok": True}
+
+    a._app.client.agents_sessions_setStatus = AsyncMock(side_effect=slow)
+    first = asyncio.ensure_future(a.send_typing(CHAT, metadata=THREAD))
+    await asyncio.sleep(0.02)
+    key = next(iter(a._active_status_threads))
+    await a._seal_stream(key, {"ts": "1700000001.000100"})
+    gate.set()
+    await first
+    a._now[0] += 2.0
+    a._app.client.agents_sessions_setStatus = AsyncMock(return_value={"ok": True})
+    await a.send_typing(CHAT, metadata=THREAD)
+    assert a._app.client.agents_sessions_setStatus.await_count == 1, "re-sent after the seal"
+
+
+@pytest.mark.asyncio
+async def test_seal_resets_a_status_entry_tracked_under_a_different_team_key():
+    """Stream key team and status key team can differ (probe P3): match on channel and thread."""
+    a = _adapter()
+    await a.send_typing(CHAT, metadata=THREAD)
+    assert list(a._active_status_threads) == [("", CHAT, "1700000000.000100")]
+    await a._seal_stream(("T1", CHAT, "1700000000.000100"), {"ts": "1700000001.000100"})
+    a._now[0] += 2.0
+    await a.send_typing(CHAT, metadata=THREAD)
+    assert _sent(a) == ["processing", "processing"]

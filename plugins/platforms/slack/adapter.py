@@ -2669,9 +2669,13 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             # (tool-call segment break) leaves the turn running, so the change-only status gate
             # must send ``processing`` again on the next tick; the final seal is followed by
             # stop_typing, which drops this entry anyway.
-            _entry = self._active_status_threads.get(key)
-            if isinstance(_entry, dict):
-                _entry["next_due"] = None
+            # The stream key's team comes from scope_id_for_chat and the status key's from
+            # _channel_team, which can differ (one is empty before the first inbound event), so
+            # match on channel and thread.
+            for _k, _entry in list(self._active_status_threads.items()):
+                if _k[1:] == key[1:] and isinstance(_entry, dict):
+                    _entry["next_due"] = None
+                    _entry["gen"] = _entry.get("gen", 0) + 1
 
     async def _try_finalize_stream(
         self, chat_id: str, content: str, metadata: Optional[dict[str, Any]] = None
@@ -2779,10 +2783,16 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
                 _status_started = _prev_entry.get("started")
             if not isinstance(_status_started, (int, float)):
                 _status_started = time.monotonic()
-            _next_due = _prev_entry.get("next_due") if isinstance(_prev_entry, dict) else None
-            self._active_status_threads[status_key] = {
-                "thread_ts": str(thread_ts), "team_id": str(team_id) if team_id else "",
-                "started": _status_started, "next_due": _next_due}
+            if isinstance(_prev_entry, dict):
+                # Update in place: an in-flight _send_processing holds this dict and records its
+                # result into it, even after the send_typing call that started it was cancelled.
+                _prev_entry.update(
+                    thread_ts=str(thread_ts), team_id=str(team_id) if team_id else "",
+                    started=_status_started)
+            else:
+                self._active_status_threads[status_key] = {
+                    "thread_ts": str(thread_ts), "team_id": str(team_id) if team_id else "",
+                    "started": _status_started, "next_due": None, "gen": 0}
             # Evict oldest-thread-first (key[2] is the thread ts) so the newest survives.
             self._evict_oldest_by_ts(
                 self._active_status_threads, self._ACTIVE_STATUS_THREADS_MAX, lambda k: k[2])
@@ -2807,7 +2817,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
                 # outcome even when this coroutine is cancelled.
                 _entry["next_due"] = _now + self._STATUS_RETRY_SECONDS
                 await asyncio.shield(self._send_processing(
-                    _entry, chat_id, team_id, thread_ts))
+                    _entry, chat_id, team_id, thread_ts, _entry.get("gen", 0)))
                 return
         _start = "processing" if _sdk_supports_agent_sessions() else (
             getattr(self, "_status_text", {}).get(str(chat_id)) or getattr(
@@ -2818,10 +2828,16 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         return time.monotonic()
 
     async def _send_processing(
-        self, entry: dict[str, Any], chat_id: str, team_id: str, thread_ts: str) -> None:
+        self, entry: dict[str, Any], chat_id: str, team_id: str, thread_ts: str, gen: int = 0
+    ) -> None:
         """Send ``processing`` and record when the next send is due: after the 3000 s refresh on
-        success, after the retry delay (30 s, or Slack's Retry-After) on a rejection."""
+        success, after the retry delay (30 s, or Slack's Retry-After) on a rejection. A stream seal
+        that ran while the call was in flight bumped ``gen``: Slack set ``active`` after our
+        ``processing``, so the next tick must send again instead of waiting out the refresh."""
         retry = await self._set_thread_status(chat_id, team_id, thread_ts, "processing", "failed")
+        if entry.get("gen", 0) != gen:
+            entry["next_due"] = None
+            return
         delay = self._PROCESSING_REFRESH_SECONDS if retry is None else retry
         entry["next_due"] = self._status_clock() + delay
 
